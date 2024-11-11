@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
  */
-/* Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved. */
 
 #include <linux/iommu.h>
 #include <linux/qcom_scm.h>
@@ -10,6 +10,10 @@
 #include <linux/irqreturn.h>
 #include <linux/reset.h>
 #include <linux/interconnect.h>
+#include <linux/version.h>
+#if (KERNEL_VERSION(5, 15, 0) > LINUX_VERSION_CODE)
+#include <soc/qcom/subsystem_restart.h>
+#endif
 #include <linux/of_address.h>
 #include <linux/firmware.h>
 #include <linux/qcom_scm.h>
@@ -18,7 +22,6 @@
 
 #include "venus_hfi.h"
 #include "msm_vidc_core.h"
-#include "msm_vidc_control.h"
 #include "msm_vidc_power.h"
 #include "msm_vidc_platform.h"
 #include "msm_vidc_memory.h"
@@ -530,7 +533,7 @@ int __set_registers(struct msm_vidc_core *core)
 }
 
 static int __vote_bandwidth(struct bus_info *bus,
-	unsigned long bw_kbps)
+	unsigned long ab_kbps, unsigned long ib_kbps)
 {
 	int rc = 0;
 
@@ -539,11 +542,11 @@ static int __vote_bandwidth(struct bus_info *bus,
 		return -EINVAL;
 	}
 
-	d_vpr_p("Voting bus %s to ab %lu kBps\n", bus->name, bw_kbps);
-	rc = icc_set_bw(bus->path, bw_kbps, 0);
+	d_vpr_p("Voting bus %s to ab %lu ib %lu kBps\n", bus->name, ab_kbps, ib_kbps);
+	rc = icc_set_bw(bus->path, ab_kbps, ib_kbps);
 	if (rc)
-		d_vpr_e("Failed voting bus %s to ab %lu, rc=%d\n",
-				bus->name, bw_kbps, rc);
+		d_vpr_e("Failed voting bus %s to ab %lu ib %lu, rc=%d\n",
+				bus->name, ab_kbps, ib_kbps, rc);
 
 	return rc;
 }
@@ -562,7 +565,7 @@ int __unvote_buses(struct msm_vidc_core *core)
 	core->power.bw_llcc = 0;
 
 	venus_hfi_for_each_bus(core, bus) {
-		rc = __vote_bandwidth(bus, 0);
+		rc = __vote_bandwidth(bus, 0, 0);
 		if (rc)
 			goto err_unknown_device;
 	}
@@ -576,10 +579,10 @@ int __vote_buses(struct msm_vidc_core *core,
 {
 	int rc = 0;
 	struct bus_info *bus = NULL;
-	unsigned long bw_kbps = 0, bw_prev = 0;
+	unsigned long ab_kbps = 0, ib_kbps = 0, bw_prev = 0;
 	enum vidc_bus_type type;
 
-	if (!core) {
+	if (!core || !core->platform) {
 		d_vpr_e("%s: invalid params\n", __func__);
 		return -EINVAL;
 	}
@@ -589,33 +592,37 @@ int __vote_buses(struct msm_vidc_core *core,
 			type = get_type_frm_name(bus->name);
 
 			if (type == DDR) {
-				bw_kbps = bw_ddr;
+				ab_kbps = bw_ddr;
 				bw_prev = core->power.bw_ddr;
 			} else if (type == LLCC) {
-				bw_kbps = bw_llcc;
+				ab_kbps = bw_llcc;
 				bw_prev = core->power.bw_llcc;
 			} else {
-				bw_kbps = bus->range[1];
+				ab_kbps = bus->range[1];
 				bw_prev = core->power.bw_ddr ?
-						bw_kbps : 0;
+						ab_kbps : 0;
 			}
 
 			/* ensure freq is within limits */
-			bw_kbps = clamp_t(typeof(bw_kbps), bw_kbps,
+			ab_kbps = clamp_t(typeof(ab_kbps), ab_kbps,
 				bus->range[0], bus->range[1]);
 
-			if (TRIVIAL_BW_CHANGE(bw_kbps, bw_prev) && bw_prev) {
+			if (TRIVIAL_BW_CHANGE(ab_kbps, bw_prev) && bw_prev) {
 				d_vpr_l("Skip voting bus %s to %lu kBps\n",
-					bus->name, bw_kbps);
+					bus->name, ab_kbps);
 				continue;
 			}
 
-			rc = __vote_bandwidth(bus, bw_kbps);
+			if (core->platform->data.vpu_ver == VENUS_VERSION_AR50LT_V1 ||
+			    core->platform->data.vpu_ver == VENUS_VERSION_AR50LT_V2)
+				ib_kbps = 2 * ab_kbps;
+
+			rc = __vote_bandwidth(bus, ab_kbps, ib_kbps);
 
 			if (type == DDR)
-				core->power.bw_ddr = bw_kbps;
+				core->power.bw_ddr = ab_kbps;
 			else if (type == LLCC)
-				core->power.bw_llcc = bw_kbps;
+				core->power.bw_llcc = ab_kbps;
 		} else {
 			d_vpr_e("No BUS to Vote\n");
 		}
@@ -1104,6 +1111,7 @@ static void __flush_debug_queue(struct msm_vidc_core *core,
 	struct hfi_debug_header *pkt;
 	bool local_packet = false;
 	enum vidc_msg_prio log_level = msm_vidc_debug;
+	int rc = 0;
 
 	if (!core) {
 		d_vpr_e("%s: invalid params\n", __func__);
@@ -1111,11 +1119,11 @@ static void __flush_debug_queue(struct msm_vidc_core *core,
 	}
 
 	if (!packet || !packet_size) {
-		if (msm_vidc_vmem_alloc(VIDC_IFACEQ_VAR_HUGE_PKT_SIZE,
-			(void **)&packet, __func__))
+		rc = msm_vidc_vmem_alloc(VIDC_IFACEQ_VAR_HUGE_PKT_SIZE, (void **)&packet, __func__);
+		if (rc)
 			return;
-		packet_size = VIDC_IFACEQ_VAR_HUGE_PKT_SIZE;
 
+		packet_size = VIDC_IFACEQ_VAR_HUGE_PKT_SIZE;
 		local_packet = true;
 
 		/*
@@ -1742,10 +1750,6 @@ static int __init_subcaches(struct msm_vidc_core *core)
 			sinfo->subcache = llcc_slice_getd(LLCC_VIDSC1);
 		} else if (!strcmp("vidscfw", sinfo->name)) {
 			sinfo->subcache = llcc_slice_getd(LLCC_VIDFW);
-		} else if (!strcmp("vidvsp", sinfo->name)) {
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5,15,0))
-			sinfo->subcache = llcc_slice_getd(LLCC_VIDVSP);
-#endif
 		} else {
 			d_vpr_e("Invalid subcache name %s\n",
 					sinfo->name);
@@ -2214,11 +2218,6 @@ void venus_hfi_interface_queues_deinit(struct msm_vidc_core *core)
 
 	d_vpr_h("%s()\n", __func__);
 
-	if (!core->iface_q_table.align_virtual_addr) {
-		d_vpr_h("%s: queues already deallocated\n", __func__);
-		return;
-	}
-
 	msm_vidc_memory_unmap(core, &core->iface_q_table.map);
 	msm_vidc_memory_free(core, &core->iface_q_table.alloc);
 	msm_vidc_memory_unmap(core, &core->sfr.map);
@@ -2496,8 +2495,6 @@ int __load_fw(struct msm_vidc_core *core)
 	d_vpr_h("%s\n", __func__);
 	core->handoff_done = false;
 	core->hw_power_control = false;
-	core->cpu_watchdog = false;
-	core->video_unresponsive = false;
 
 	trace_msm_v4l2_vidc_fw_load("START");
 	rc = __init_resources(core);
@@ -2578,9 +2575,6 @@ void __unload_fw(struct msm_vidc_core *core)
 	__venus_power_off(core);
 	__deinit_resources(core);
 
-	core->cpu_watchdog = false;
-	core->video_unresponsive = false;
-
 	d_vpr_h("%s done\n", __func__);
 }
 
@@ -2590,8 +2584,6 @@ static int __response_handler(struct msm_vidc_core *core)
 
 	if (call_venus_op(core, watchdog, core, core->intr_status)) {
 		struct hfi_packet pkt = {.type = HFI_SYS_ERROR_WD_TIMEOUT};
-		core->cpu_watchdog = true;
-		d_vpr_e("%s: CPU WD error received\n", __func__);
 
 		return handle_system_error(core, &pkt);
 	}
@@ -2669,7 +2661,6 @@ void venus_hfi_pm_work_handler(struct work_struct *work)
 		d_vpr_e("Failed to PC for %d times\n",
 				core->skip_pc_count);
 		core->skip_pc_count = 0;
-		core->video_unresponsive = true;
 		msm_vidc_core_deinit(core, true);
 		return;
 	}
@@ -2971,53 +2962,6 @@ unlock:
 	return rc;
 }
 
-int venus_hfi_reserve_hardware(struct msm_vidc_inst *inst, u32 duration)
-{
-	struct msm_vidc_core *core;
-	enum hfi_reserve_type payload;
-	int rc = 0;
-
-	if (!inst || !inst->core || !inst->packet) {
-		d_vpr_e("%s: Invalid params\n", __func__);
-		return -EINVAL;
-	}
-	core = inst->core;
-	core_lock(core, __func__);
-
-	if (!__valdiate_session(core, inst, __func__)) {
-		rc = -EINVAL;
-		goto unlock;
-	}
-
-	if (duration)
-		payload = HFI_RESERVE_START;
-	else
-		payload = HFI_RESERVE_STOP;
-
-	rc = hfi_create_header(inst->packet, inst->packet_size,
-		inst->session_id, core->header_id++);
-	if (rc)
-		goto unlock;
-
-	rc = hfi_create_packet(inst->packet, inst->packet_size,
-		HFI_CMD_RESERVE,
-		HFI_HOST_FLAGS_NONE,
-		HFI_PAYLOAD_U32_ENUM,
-		HFI_PORT_NONE,
-		core->packet_id++,
-		&payload, sizeof(u32));
-	if (rc)
-		goto unlock;
-
-	rc = __iface_cmdq_write(core, inst->packet);
-	if (rc)
-		goto unlock;
-
-unlock:
-	core_unlock(core, __func__);
-	return rc;
-}
-
 int venus_hfi_session_open(struct msm_vidc_inst *inst)
 {
 	int rc = 0;
@@ -3147,43 +3091,6 @@ unlock:
 	return rc;
 }
 
-static int venus_hfi_cache_packet(struct msm_vidc_inst *inst)
-{
-	int rc = 0;
-	struct hfi_header *hdr;
-	struct hfi_pending_packet *packet;
-
-	if (!inst->packet) {
-		d_vpr_e("%s: invalid params\n", __func__);
-		return -EINVAL;
-	}
-
-	hdr = (struct hfi_header *)inst->packet;
-	if (hdr->size < sizeof(struct hfi_header)) {
-		d_vpr_e("%s: invalid hdr size %d\n", __func__, hdr->size);
-		return -EINVAL;
-	}
-
-	packet = msm_memory_pool_alloc(inst, MSM_MEM_POOL_PACKET);
-	if (!packet) {
-		i_vpr_e(inst, "%s: failed to allocate pending packet\n", __func__);
-		return -ENOMEM;
-	}
-
-	INIT_LIST_HEAD(&packet->list);
-	list_add_tail(&packet->list, &inst->pending_pkts);
-	packet->data = (u8 *)packet + sizeof(struct hfi_pending_packet);
-
-	if (hdr->size > MSM_MEM_POOL_PACKET_SIZE) {
-		i_vpr_e(inst, "%s: header size %d exceeds pool packet size %d\n",
-			__func__, hdr->size, MSM_MEM_POOL_PACKET_SIZE);
-		return -EINVAL;
-	}
-	memcpy(packet->data, inst->packet, hdr->size);
-
-	return rc;
-}
-
 int venus_hfi_session_property(struct msm_vidc_inst *inst,
 	u32 pkt_type, u32 flags, u32 port, u32 payload_type,
 	void *payload, u32 payload_size)
@@ -3217,12 +3124,6 @@ int venus_hfi_session_property(struct msm_vidc_inst *inst,
 				payload_size);
 	if (rc)
 		goto unlock;
-
-	/* skip sending packet to firmware */
-	if (inst->request) {
-		rc = venus_hfi_cache_packet(inst);
-		goto unlock;
-	}
 
 	rc = __iface_cmdq_write(inst->core, inst->packet);
 	if (rc)
@@ -3359,137 +3260,6 @@ unlock:
 	return rc;
 }
 
-int venus_hfi_session_pause(struct msm_vidc_inst *inst, enum msm_vidc_port_type port)
-{
-	int rc = 0;
-	struct msm_vidc_core* core;
-
-	if (!inst || !inst->core || !inst->packet) {
-		d_vpr_e("%s: invalid params\n", __func__);
-		return -EINVAL;
-	}
-	core = inst->core;
-	core_lock(core, __func__);
-
-	if (!__valdiate_session(core, inst, __func__)) {
-		rc = -EINVAL;
-		goto unlock;
-	}
-
-	if (port != INPUT_PORT && port != OUTPUT_PORT) {
-		i_vpr_e(inst, "%s: invalid port %d\n", __func__, port);
-		goto unlock;
-	}
-
-	rc = hfi_packet_session_command(inst,
-				HFI_CMD_PAUSE,
-				(HFI_HOST_FLAGS_RESPONSE_REQUIRED |
-				HFI_HOST_FLAGS_INTR_REQUIRED),
-				get_hfi_port(inst, port),
-				inst->session_id,
-				HFI_PAYLOAD_NONE,
-				NULL,
-				0);
-	if (rc)
-		goto unlock;
-
-	rc = __iface_cmdq_write(inst->core, inst->packet);
-	if (rc)
-		goto unlock;
-
-unlock:
-	core_unlock(core, __func__);
-	return rc;
-}
-
-int venus_hfi_session_resume(struct msm_vidc_inst *inst,
-	enum msm_vidc_port_type port, u32 payload)
-{
-	int rc = 0;
-	struct msm_vidc_core* core;
-
-	if (!inst || !inst->core || !inst->packet) {
-		d_vpr_e("%s: invalid params\n", __func__);
-		return -EINVAL;
-	}
-	core = inst->core;
-	core_lock(core, __func__);
-
-	if (!__valdiate_session(core, inst, __func__)) {
-		rc = -EINVAL;
-		goto unlock;
-	}
-
-	if (port != INPUT_PORT && port != OUTPUT_PORT) {
-		i_vpr_e(inst, "%s: invalid port %d\n", __func__, port);
-		goto unlock;
-	}
-
-	rc = hfi_packet_session_command(inst,
-				HFI_CMD_RESUME,
-				(HFI_HOST_FLAGS_RESPONSE_REQUIRED |
-				HFI_HOST_FLAGS_INTR_REQUIRED),
-				get_hfi_port(inst, port),
-				inst->session_id,
-				HFI_PAYLOAD_U32,
-				&payload,
-				sizeof(u32));
-	if (rc)
-		goto unlock;
-
-	rc = __iface_cmdq_write(inst->core, inst->packet);
-	if (rc)
-		goto unlock;
-
-unlock:
-	core_unlock(core, __func__);
-	return rc;
-}
-
-int venus_hfi_session_drain(struct msm_vidc_inst *inst, enum msm_vidc_port_type port)
-{
-	int rc = 0;
-	struct msm_vidc_core* core;
-
-	if (!inst || !inst->core || !inst->packet) {
-		d_vpr_e("%s: invalid params\n", __func__);
-		return -EINVAL;
-	}
-	core = inst->core;
-	core_lock(core, __func__);
-
-	if (!__valdiate_session(core, inst, __func__)) {
-		rc = -EINVAL;
-		goto unlock;
-	}
-
-	if (port != INPUT_PORT) {
-		i_vpr_e(inst, "%s: invalid port %d\n", __func__, port);
-		goto unlock;
-	}
-
-	rc = hfi_packet_session_command(inst,
-				HFI_CMD_DRAIN,
-				(HFI_HOST_FLAGS_RESPONSE_REQUIRED |
-				HFI_HOST_FLAGS_INTR_REQUIRED |
-				HFI_HOST_FLAGS_NON_DISCARDABLE),
-				get_hfi_port(inst, port),
-				inst->session_id,
-				HFI_PAYLOAD_NONE,
-				NULL,
-				0);
-	if (rc)
-		goto unlock;
-
-	rc = __iface_cmdq_write(inst->core, inst->packet);
-	if (rc)
-		goto unlock;
-
-unlock:
-	core_unlock(core, __func__);
-	return rc;
-}
-
 int venus_hfi_session_command(struct msm_vidc_inst *inst,
 	u32 cmd, enum msm_vidc_port_type port, u32 payload_type,
 	void *payload, u32 payload_size)
@@ -3585,7 +3355,7 @@ int venus_hfi_queue_super_buffer(struct msm_vidc_inst *inst,
 	}
 
 	/* Sanitize super meta buffer */
-	if (metabuf && meta_size * batch_size > metabuf->buffer_size) {
+	if (metabuf && meta_size * batch_size != metabuf->buffer_size) {
 		i_vpr_e(inst, "%s: invalid super meta buffer. meta %u, batch %u, buffer size %u\n",
 			__func__, meta_size, batch_size, metabuf->buffer_size);
 		goto unlock;
@@ -3655,57 +3425,14 @@ unlock:
 	return rc;
 }
 
-static int venus_hfi_add_pending_packets(struct msm_vidc_inst *inst)
-{
-	int rc = 0;
-	int num_packets = 0;
-	struct hfi_pending_packet *pkt_info, *dummy;
-	struct hfi_header *hdr, *src_hdr;
-	struct hfi_packet *src_pkt;
-
-	if (!inst || !inst->packet) {
-		d_vpr_e("%s: invalid params\n", __func__);
-		return -EINVAL;
-	}
-
-	hdr = (struct hfi_header *)inst->packet;
-	if (hdr->size < sizeof(struct hfi_header)) {
-		i_vpr_e(inst, "%s: invalid hdr size %d\n",
-			__func__, hdr->size);
-		return -EINVAL;
-	}
-
-	list_for_each_entry_safe(pkt_info, dummy, &inst->pending_pkts, list) {
-		src_hdr = (struct hfi_header *)(pkt_info->data);
-		num_packets = src_hdr->num_packets;
-		src_pkt = (struct hfi_packet *)((u8 *)src_hdr + sizeof(struct hfi_header));
-		while (num_packets > 0) {
-			memcpy((u8 *)hdr + hdr->size, (void *)src_pkt, src_pkt->size);
-			hdr->num_packets++;
-			hdr->size += src_pkt->size;
-			num_packets--;
-			src_pkt = (struct hfi_packet *)((u8 *)src_pkt + src_pkt->size);
-			if ((u8 *)src_pkt < (u8 *)src_hdr ||
-					(u8 *)src_pkt > (u8 *)src_hdr + hdr->size) {
-				i_vpr_e(inst, "%s: invalid packet address\n", __func__);
-				return -EINVAL;
-			}
-		}
-		list_del(&pkt_info->list);
-		msm_memory_pool_free(inst, pkt_info);
-	}
-	return rc;
-}
-
 int venus_hfi_queue_buffer(struct msm_vidc_inst *inst,
 	struct msm_vidc_buffer *buffer, struct msm_vidc_buffer *metabuf)
 {
 	int rc = 0;
 	struct msm_vidc_core *core;
 	struct hfi_buffer hfi_buffer;
-	enum hfi_packet_payload_info payload_type;
 
-	if (!inst || !inst->core || !inst->packet || !inst->capabilities) {
+	if (!inst || !inst->core || !inst->packet) {
 		d_vpr_e("%s: invalid params\n", __func__);
 		return -EINVAL;
 	}
@@ -3754,34 +3481,6 @@ int venus_hfi_queue_buffer(struct msm_vidc_inst *inst,
 		if (rc)
 			goto unlock;
 	}
-
-	if (is_meta_rx_inp_enabled(inst, META_OUTBUF_FENCE) &&
-		is_output_buffer(buffer->type)) {
-		payload_type = buffer->fence_count == 1 ? HFI_PAYLOAD_U64 : HFI_PAYLOAD_U64_ARRAY;
-		if (buffer->fence_count > MAX_FENCE_COUNT) {
-			i_vpr_e(inst, "%s: invalid fence count %d\n",
-				__func__, buffer->fence_count);
-			rc = -EINVAL;
-			goto unlock;
-		}
-
-		rc = hfi_create_packet(inst->packet,
-			inst->packet_size,
-			HFI_PROP_FENCE,
-			0,
-			payload_type,
-			HFI_PORT_RAW,
-			core->packet_id++,
-			&buffer->fence_id[0],
-			buffer->fence_count * sizeof(u64));
-		if (rc)
-			goto unlock;
-
-	}
-
-	rc = venus_hfi_add_pending_packets(inst);
-	if (rc)
-		goto unlock;
 
 	rc = __iface_cmdq_write(inst->core, inst->packet);
 	if (rc)
@@ -3892,70 +3591,6 @@ int venus_hfi_scale_buses(struct msm_vidc_inst *inst, u64 bw_ddr, u64 bw_llcc)
 	rc = __vote_buses(core, bw_ddr, bw_llcc);
 	if (rc)
 		goto exit;
-
-exit:
-	core_unlock(core, __func__);
-
-	return rc;
-}
-
-int venus_hfi_set_ir_period(struct msm_vidc_inst *inst, u32 ir_type,
-	enum msm_vidc_inst_capability_type cap_id)
-{
-	int rc = 0;
-	struct msm_vidc_core *core;
-	u32 ir_period, sync_frame_req = 0;
-
-	if (!inst || !inst->core) {
-		d_vpr_e("%s: invalid params\n", __func__);
-		return -EINVAL;
-	}
-	core = inst->core;
-
-	core_lock(core, __func__);
-
-	ir_period = inst->capabilities->cap[cap_id].value;
-
-	rc = hfi_create_header(inst->packet, inst->packet_size,
-			       inst->session_id, core->header_id++);
-	if (rc)
-		goto exit;
-
-	/* Request sync frame if ir period enabled dynamically */
-	if (!inst->ir_enabled) {
-		inst->ir_enabled = ((ir_period > 0) ? true : false);
-		if (inst->ir_enabled && inst->bufq[OUTPUT_PORT].vb2q->streaming) {
-			sync_frame_req = HFI_SYNC_FRAME_REQUEST_WITH_PREFIX_SEQ_HDR;
-			rc = hfi_create_packet(inst->packet, inst->packet_size,
-					       HFI_PROP_REQUEST_SYNC_FRAME,
-					       HFI_HOST_FLAGS_NONE,
-					       HFI_PAYLOAD_U32_ENUM,
-					       msm_vidc_get_port_info(inst, REQUEST_I_FRAME),
-					       core->packet_id++,
-					       &sync_frame_req,
-					       sizeof(u32));
-			if (rc)
-				goto exit;
-		}
-	}
-
-	rc = hfi_create_packet(inst->packet, inst->packet_size,
-			       ir_type,
-			       HFI_HOST_FLAGS_NONE,
-			       HFI_PAYLOAD_U32,
-			       msm_vidc_get_port_info(inst, cap_id),
-			       core->packet_id++,
-			       &ir_period,
-			       sizeof(u32));
-	if (rc)
-		goto exit;
-
-	rc = __iface_cmdq_write(inst->core, inst->packet);
-	if (rc) {
-		i_vpr_e(inst, "%s: failed to set cap[%d] %s to fw\n",
-			__func__, cap_id, cap_name(cap_id));
-		goto exit;
-	}
 
 exit:
 	core_unlock(core, __func__);

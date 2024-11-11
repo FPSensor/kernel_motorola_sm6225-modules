@@ -1,17 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
-TARGET_VIDC_ENABLE := false
-ifeq ($(TARGET_KERNEL_DLKM_DISABLE), true)
-	ifeq ($(TARGET_KERNEL_DLKM_VIDEO_OVERRIDE), true)
-		TARGET_VIDC_ENABLE := true
-	endif
-else
-TARGET_VIDC_ENABLE := true
-endif
-
-ifeq ($(TARGET_VIDC_ENABLE),true)
 BOARD_OPENSOURCE_DIR ?= vendor/qcom/opensource
 VIDEO_BLD_DIR := $(shell pwd)/$(BOARD_OPENSOURCE_DIR)/video-driver
-
 VIDEO_SELECT := CONFIG_MSM_VIDC_V4L2=m
 
 # Build msm_video.ko
@@ -45,4 +34,3 @@ LOCAL_ADDITIONAL_DEPENDENCIES := $(call intermediates-dir-for,DLKM,mmrm-module-s
 # Include kp_module.ko in the /vendor/lib/modules (vendor.img)
 # BOARD_VENDOR_KERNEL_MODULES += $(LOCAL_MODULE_PATH)/$(LOCAL_MODULE)
 include $(DLKM_DIR)/Build_external_kernelmodule.mk
-endif
