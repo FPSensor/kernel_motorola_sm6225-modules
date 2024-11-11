@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/kernel.h>
@@ -200,7 +200,7 @@ static void dsi_pll_config_slave(struct dsi_pll_resource *rsc)
 
 	if (!orsc) {
 		DSI_PLL_DBG(rsc,
-			"slave PLL unavailable, assuming standalone config\n");
+			"slave PLL unavilable, assuming standalone config\n");
 		return;
 	}
 
@@ -1236,18 +1236,17 @@ static int dsi_pll_read_stored_trim_codes(struct dsi_pll_resource *pll_res,
 			codes_info->pll_codes.pll_codes_2,
 			codes_info->pll_codes.pll_codes_3);
 
-		if (vco_clk_rate != codes_info->clk_rate &&
-				codes_info->is_valid)
-			continue;
-
-		pll_res->cache_pll_trim_codes[0] =
-			codes_info->pll_codes.pll_codes_1;
-		pll_res->cache_pll_trim_codes[1] =
-			codes_info->pll_codes.pll_codes_2;
-		pll_res->cache_pll_trim_codes[2] =
-			codes_info->pll_codes.pll_codes_3;
-		found = true;
-		break;
+		if (vco_clk_rate == codes_info->clk_rate &&
+					codes_info->is_valid) {
+			pll_res->cache_pll_trim_codes[0] =
+				codes_info->pll_codes.pll_codes_1;
+			pll_res->cache_pll_trim_codes[1] =
+				codes_info->pll_codes.pll_codes_2;
+			pll_res->cache_pll_trim_codes[2] =
+				codes_info->pll_codes.pll_codes_3;
+			found = true;
+			break;
+		}
 	}
 
 	if (!found)
@@ -1557,8 +1556,7 @@ int dsi_pll_5nm_configure(void *pll, bool commit)
 	if (rsc->slave)
 		dsi_pll_enable_pll_bias(rsc->slave);
 
-	if (commit)
-		dsi_pll_init_val(rsc);
+	dsi_pll_init_val(rsc);
 
 	rc = dsi_pll_5nm_set_byteclk_div(rsc, commit);
 

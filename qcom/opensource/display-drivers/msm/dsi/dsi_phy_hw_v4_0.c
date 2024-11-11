@@ -387,11 +387,6 @@ static void dsi_phy_hw_dphy_enable(struct dsi_phy_hw *phy,
 		glbl_rescode_bot_ctrl = less_than_1500_mhz ? 0x39 :  0x3c;
 		glbl_str_swi_cal_sel_ctrl = 0x00;
 		glbl_hstx_str_ctrl_0 = 0x88;
-
-		if (cfg->phy_drive_strength != glbl_hstx_str_ctrl_0) {
-			glbl_str_swi_cal_sel_ctrl = 0x03;
-			glbl_hstx_str_ctrl_0 = cfg->phy_drive_strength;
-		}
 	} else {
 		vreg_ctrl_0 = less_than_1500_mhz ? 0x5B : 0x59;
 		glbl_str_swi_cal_sel_ctrl = less_than_1500_mhz ? 0x03 : 0x00;
@@ -970,4 +965,12 @@ void dsi_phy_hw_v4_0_set_continuous_clk(struct dsi_phy_hw *phy, bool enable)
 	}
 
 	wmb(); /* make sure request is set */
+}
+
+void dsi_phy_hw_v4_0_phy_idle_off(struct dsi_phy_hw *phy)
+{
+	if (phy->version >= DSI_PHY_VERSION_4_2 && phy->clamp_enable) {
+		DSI_W32(phy, DSIPHY_CMN_CTRL_4, 0x1);
+		DSI_W32(phy, DSIPHY_CMN_CTRL_3, 0x0);
+	}
 }
