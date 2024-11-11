@@ -16,6 +16,7 @@
 #include <linux/completion.h>
 #include <linux/of_irq.h>
 #include <linux/clk.h>
+#include <linux/version.h>
 #ifdef CONFIG_OF
 #include <linux/of_gpio.h>
 #include <linux/regulator/consumer.h>
@@ -29,6 +30,10 @@
 #endif
 #ifdef CONFIG_GTP_LAST_TIME
 #include <linux/ktime.h>
+#endif
+
+#ifdef GTP_PEN_NOTIFIER
+#include <linux/pen_detection_notify.h>
 #endif
 
 #define GOODIX_CORE_DRIVER_NAME			"goodix_ts"
@@ -67,6 +72,10 @@
 #define GOODIX_GESTURE_FOD_UP			0x55
 #define GOODIX_GESTURE_UNDER_WATER		0x20
 #define GOODIX_GESTURE_PALM_DETECTION		0x40
+
+#ifndef fallthrough
+#define fallthrough do {} while (0) /* fallthrough */
+#endif
 
 enum GOODIX_GESTURE_TYP {
 	GESTURE_SINGLE_TAP = (1 << 0),
@@ -583,6 +592,11 @@ struct goodix_ts_core {
 	atomic_t allow_capture;
 	bool data_valid;
 	struct mutex frame_log_lock;
+#endif
+
+#ifdef GTP_PEN_NOTIFIER
+	int gtp_pen_detect_flag;
+	struct notifier_block pen_notif;
 #endif
 };
 

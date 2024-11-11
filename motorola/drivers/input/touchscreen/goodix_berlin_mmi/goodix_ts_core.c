@@ -14,24 +14,27 @@
   * General Public License for more details.
   *
   */
-#include <linux/version.h>
 #include <linux/fs.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
+#include "goodix_ts_core.h"
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 38)
 #include <linux/input/mt.h>
 #define INPUT_TYPE_B_PROTOCOL
 #endif
 
-#include "goodix_ts_core.h"
 #include "goodix_ts_mmi.h"
 
 #define PINCTRL_STATE_ACTIVE    "pmx_ts_active"
 #define PINCTRL_STATE_SUSPEND   "pmx_ts_suspend"
 #define GOODIX_DEFAULT_CFG_NAME 	"goodix_cfg_group.cfg"
 #define GOOIDX_INPUT_PHYS			"goodix_ts/input0"
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0))
+#define PDE_DATA(x) pde_data(x)
+#endif
 
 struct goodix_module goodix_modules;
 int core_module_prob_sate = CORE_MODULE_UNPROBED;
@@ -1263,6 +1266,10 @@ static void goodix_ts_report_finger(struct input_dev *dev,
 					touch_data->coords[i].y);
 			input_report_abs(dev, ABS_MT_TOUCH_MAJOR,
 					touch_data->coords[i].w);
+#ifdef CONFIG_MOTO_DDA_PASSIVESTYLUS
+			input_report_abs(dev, ABS_MT_PRESSURE,
+					touch_data->coords[i].w);
+#endif
 		} else {
 			if (touchdown[i] == 1) {
 				ts_debug("TOUCH: [%d] release\n", i);
@@ -1712,6 +1719,10 @@ static int goodix_ts_input_dev_config(struct goodix_ts_core *core_data)
 			     0, ts_bdata->panel_max_y, 0, 0);
 	input_set_abs_params(input_dev, ABS_MT_TOUCH_MAJOR,
 			     0, ts_bdata->panel_max_w, 0, 0);
+#ifdef CONFIG_MOTO_DDA_PASSIVESTYLUS
+	input_set_abs_params(input_dev, ABS_MT_PRESSURE,
+			     0, ts_bdata->panel_max_w, 0, 0);
+#endif
 #ifdef CONFIG_ENABLE_GTP_PALM_CANCEL
 	input_set_abs_params(input_dev, ABS_MT_TOOL_TYPE,
 			     MT_TOOL_FINGER, MT_TOOL_PALM, 0, 0);
@@ -2237,6 +2248,7 @@ static int goodix_generic_noti_callback(struct notifier_block *self,
 		ret = goodix_send_ic_config(cd, CONFIG_TYPE_NORMAL);
 		if (ret)
 			ts_info("failed send normal config[ignore]");
+		fallthrough;
 	case NOTIFY_FWUPDATE_FAILED:
 		if (hw_ops->read_version(cd, &cd->fw_version))
 			ts_info("failed read fw version info[ignore]");
@@ -2449,6 +2461,40 @@ static void goodix_palm_sensor_release_timer_handler(struct timer_list *t)
 }
 #endif
 
+#ifdef GTP_PEN_NOTIFIER
+static int pen_notifier_callback(struct notifier_block *self,
+				unsigned long event, void *data)
+{
+	int ret = 0;
+	struct goodix_ts_core *cd = container_of(self,
+		struct goodix_ts_core, pen_notif);
+
+	ts_info("Received event(%lu) for pen detection\n", event);
+
+	if (event == PEN_DETECTION_INSERT)
+		cd->gtp_pen_detect_flag = 0x0;
+	else if (event == PEN_DETECTION_PULL)
+		cd->gtp_pen_detect_flag = 0x1;
+
+	mutex_lock_interruptible(&cd->mode_lock);
+
+	if (cd->power_on == 0) {
+		ts_err("The touch is in sleep state, restore the value when resume\n");
+		goto exit;
+	}
+
+	ret = goodix_ts_send_cmd(cd, 0x32, 5, cd->gtp_pen_detect_flag, 0x00);
+	if (ret < 0) {
+		ts_err("failed to send passive pen mode cmd");
+		goto exit;
+	}
+
+exit:
+	mutex_unlock(&cd->mode_lock);
+	return ret;
+}
+#endif
+
 /**
  * goodix_ts_probe - called by kernel when Goodix touch
  *  platform driver is added.
@@ -2603,6 +2649,14 @@ static int goodix_ts_probe(struct platform_device *pdev)
 
 	atomic_set(&core_data->allow_capture, 1);
 	ts_info("Enable ghost log capture after probe");
+#endif
+
+#ifdef GTP_PEN_NOTIFIER
+	core_data->gtp_pen_detect_flag = PEN_DETECTION_INSERT;
+	core_data->pen_notif.notifier_call = pen_notifier_callback;
+	ret = pen_detection_register_client(&core_data->pen_notif);
+	if (ret)
+		ts_err("[PEN]Unable to register pen_notifier: %d\n", ret);
 #endif
 
 	ts_info("goodix_ts_core probe success");
