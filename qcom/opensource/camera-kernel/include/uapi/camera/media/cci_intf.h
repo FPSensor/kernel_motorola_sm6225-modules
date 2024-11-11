@@ -39,6 +39,9 @@ struct msm_cci_intf_xfer {
 	struct msm_cci_intf_data      data;
 };
 
+int cam_cci_debug_sub_module_init(void);
+void cam_cci_debug_sub_module_exit(void);
+
 #define MSM_CCI_INTF_READ \
 	_IOWR('X', BASE_VIDIOC_PRIVATE + 50, struct msm_cci_intf_xfer)
 #define MSM_CCI_INTF_READ32 \

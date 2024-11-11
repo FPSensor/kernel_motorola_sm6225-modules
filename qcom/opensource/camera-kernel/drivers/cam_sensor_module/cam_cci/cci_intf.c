@@ -255,3 +255,4 @@ void cam_cci_debug_sub_module_exit(void)
 
 	misc_deregister(&cci_intf_misc);
 }
+
